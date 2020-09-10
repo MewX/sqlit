@@ -1,5 +1,5 @@
-import { Schema } from '../src/model';
-import { encodeFilter, QueryBuilder, splitKey } from '../src/filter';
+import { Schema } from 'sqlex';
+import { encodeFilter, QueryBuilder, splitKey, plainify } from '../src/filter';
 
 import helper = require('./helper');
 
@@ -46,8 +46,7 @@ test('example query', done => {
     }
   };
 
-  db
-    .table('user')
+  db.table('user')
     .select('*', { where: args })
     .then(rows => {
       expect(rows.length).toBe(1);
@@ -124,8 +123,7 @@ test('many to many', done => {
   };
 
   const db = helper.connectToDatabase(NAME, domain);
-  db
-    .table('category')
+  db.table('category')
     .select('*', { where: args })
     .then(rows => {
       expect(rows.length).toBe(1);
@@ -141,8 +139,7 @@ test('and', done => {
   const model = domain.model('user');
   const args = { and: [{ name_like: '%Apple%' }, { price_lt: 6 }] };
 
-  db
-    .table('product')
+  db.table('product')
     .select('*', { where: args })
     .then(rows => {
       expect(rows.length).toBe(1);
@@ -164,8 +161,7 @@ test('or', done => {
       }
     ]
   };
-  db
-    .table('product')
+  db.table('product')
     .select('*', { where: args })
     .then(rows => {
       expect(rows.length).toBe(4);
@@ -192,8 +188,7 @@ test('not', done => {
     ]
   };
 
-  db
-    .table('product')
+  db.table('product')
     .select('*', { where: args })
     .then(rows => {
       expect(rows.length).toBe(2);
@@ -205,7 +200,7 @@ test('order by', () => {
   const model = domain.model('OrderItem');
   const args = {
     where: { quantity_gt: 1 },
-    orderBy: ['order.code desc', 'order.user.email', 'quantity']
+    orderBy: ['-order.code', 'order.user.email', 'quantity']
   };
   const builder = new QueryBuilder(model, DefaultEscape);
   const sql = builder.select('*', args.where, args.orderBy);
@@ -213,7 +208,38 @@ test('order by', () => {
   expect(/`t\d\`.`code`\s+DESC/i.test(sql)).toBe(true);
 });
 
+test('throughField', async () => {
+  const db = helper.connectToDatabase(NAME);
+  const args = [
+    { ancestor: { products: [{ id: 3 }] } },
+    { descendant: { products: [{ id: 3 }] } }
+  ];
+  const rows = await db.table('category_tree').select('*', { where: args });
+  expect(rows.length).toBeGreaterThan(0);
+});
+
 const DefaultEscape = {
+  dialect: '',
   escapeId: s => '`' + s + '`',
   escape: s => "'" + (s + '').replace(/'/g, "\\'") + "'"
 };
+
+test('empty result', async () => {
+  const db = helper.connectToDatabase(NAME);
+  const connection = await db.pool.getConnection();
+  const rows = await db.table('user_group').select(
+    '*',
+    {
+      where: { group: [] }
+    },
+    undefined,
+    connection
+  );
+  expect(rows.length).toBe(0);
+});
+
+test('plainify', () => {
+  const value = [undefined, 1, 2];
+  const result = plainify(value);
+  expect(result).toEqual([1, 2]);
+});

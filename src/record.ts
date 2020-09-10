@@ -1,13 +1,15 @@
-import { Table, Document, _toCamel, isEmpty, isValue } from './database';
+import { Table, _toCamel, isEmpty, getUniqueFields } from './database';
 import {
   SimpleField,
   ForeignKeyField,
   UniqueKey,
-  Field,
-  RelatedField
-} from './model';
+  RelatedField,
+  Document,
+  Value,
+  isValue
+} from 'sqlex';
 import { FlushState, FlushMethod, flushRecord } from './flush';
-import { Row, Value } from './engine';
+import { Row } from './engine';
 import { copyRecord } from './copy';
 
 export type FieldValue = Value | Record;
@@ -21,17 +23,32 @@ export const RecordProxy = {
       const model = record.__table.model;
       const field = model.field(name);
       if (field instanceof ForeignKeyField) {
-        if (record.__data[name] !== undefined) {
-          throw Error('Reassignment');
+        let lhs: Value;
+        if (record.__data[name] instanceof Record) {
+          const rec = record.__data[name] as Record;
+          lhs = rec.__getValue(field.name);
+        } else {
+          lhs = record.__data[name] as Value;
+        }
+        const rhs: Value = isValue(value) ? value : model.valueOf(value, field);
+        if (lhs !== undefined && lhs != rhs) {
+          const key = `${record.__table.name}.${name}`;
+          throw Error(`Reassigning ${key}: ${lhs} (new: ${rhs})`);
         } else {
           if (value instanceof Record || value === null) {
             record.__data[name] = value;
           } else {
             const model = field.referencedField.model;
+            let removeDirty = false;
             if (typeof value !== 'object') {
               value = { [model.keyField().name]: value };
+              removeDirty = true;
             }
-            record.__data[name] = record.__table.db.table(model).append(value);
+            const parent = record.__table.db.table(model).append(value);
+            record.__data[name] = parent;
+            if (removeDirty) {
+              parent.__remove_dirty(model.keyField().name);
+            }
           }
           record.__state.dirty.add(name);
         }
@@ -40,7 +57,8 @@ export const RecordProxy = {
         record.__data[name] = _toCamel(value, field);
         record.__state.dirty.add(name);
       } else if (field instanceof RelatedField) {
-        throw Error(`Not assignable: ${model.name}.${name}`);
+        // Used by replace and __json() only
+        record.__data[name] = value;
       } else {
         throw Error(`Invalid field: ${model.name}.${name}`);
       }
@@ -72,16 +90,19 @@ export const RecordProxy = {
 };
 
 export class Record {
+  [key: string]: any;
   __table: Table;
   __data: { [key: string]: FieldValue };
   __state: FlushState;
   __related: { [key: string]: RecordSet };
+  __inserted: boolean;
 
   constructor(table: Table) {
     this.__table = table;
     this.__data = {};
     this.__state = new FlushState();
     this.__related = {};
+    this.__inserted = false;
 
     return new Proxy(this, RecordProxy);
   }
@@ -94,14 +115,18 @@ export class Record {
     if (!this.__dirty()) {
       return Promise.resolve(this);
     }
-    return this.__table.db.pool.getConnection().then(connection =>
-      connection.transaction(() =>
-        flushRecord(connection, this).then(result => {
-          connection.release();
-          return result;
-        })
-      )
-    );
+    return this.__table.db.pool.getConnection().then(connection => {
+      return new Promise(resolve => {
+        connection.transaction(() => {
+          flushRecord(connection, this).then(result => {
+            connection.commit().then(() => {
+              connection.release();
+              resolve(result);
+            });
+          });
+        });
+      });
+    });
   }
 
   update(data: Row = {}): Promise<any> {
@@ -113,7 +138,7 @@ export class Record {
   }
 
   delete(): Promise<any> {
-    const filter = this.__table.model.getUniqueFields(this.__data);
+    const filter = getUniqueFields(this.__table.model, this.__data);
     return this.__table.delete(filter);
   }
 
@@ -125,7 +150,9 @@ export class Record {
     return this.__state.dirty.size > 0;
   }
 
-  __flushable(perfect?: boolean): boolean {
+  __flushable(perfect?: number): boolean {
+    if (perfect < 0) return true;
+
     if (this.__state.merged) {
       return false;
     }
@@ -133,10 +160,13 @@ export class Record {
     const data = this.__data;
 
     if (!this.__table.model.checkUniqueKey(data, isEmpty)) {
-      return false;
-    }
-
-    if (this.__state.method === FlushMethod.DELETE) {
+      if (
+        this.__table.model.uniqueKeys.length > 1 ||
+        !this.__table.model.primaryKey.autoIncrement()
+      ) {
+        return false;
+      }
+    } else if (this.__state.method === FlushMethod.DELETE) {
       return true;
     }
 
@@ -149,6 +179,7 @@ export class Record {
     });
 
     if (flushable === 0) return false;
+
     return perfect ? flushable === this.__state.dirty.size : true;
   }
 
@@ -170,6 +201,13 @@ export class Record {
         this.__state.dirty.delete(key);
       }
     }
+  }
+
+  __is_inserted() {
+    if (this.__state.merged) {
+      return this.__state.merged.__is_inserted();
+    }
+    return this.__inserted;
   }
 
   __getValue(name: string): Value {
@@ -208,7 +246,7 @@ export class Record {
       acc[cur] = self.__getValue(cur);
       return acc;
     }, {});
-    return this.__table.model.getUniqueFields(data);
+    return getUniqueFields(this.__table.model, data);
   }
 
   __valueOf(uc: UniqueKey): string {
@@ -216,7 +254,7 @@ export class Record {
     for (const field of uc.fields) {
       let value = this.__getValue(field.name);
       if (value === undefined) return undefined;
-      values.push(value);
+      values.push(_toCamel(value, field) + '');
     }
     return JSON.stringify(values).toLocaleLowerCase();
   }
@@ -243,7 +281,7 @@ export class Record {
       const lhs = this.__getValue(name);
       const rhs = existing.__getValue(name);
       // TODO: type wise
-      if (lhs === rhs) {
+      if (lhs == rhs) {
         this.__state.dirty.delete(name);
       }
     }
@@ -258,7 +296,15 @@ export class Record {
   __json() {
     const result = {};
     for (const field of this.__table.model.fields) {
-      result[field.name] = this.__getValue(field.name);
+      const value = this.__getValue(field.name);
+      if (Array.isArray(value)) {
+        result[field.name] = (value as Record[]).map(record => record.__json());
+        for (const item of result[field.name]) {
+          delete item[(field as RelatedField).referencingField.name];
+        }
+      } else if (value !== undefined) {
+        result[field.name] = value;
+      }
     }
     return result;
   }

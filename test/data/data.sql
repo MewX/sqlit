@@ -4,11 +4,14 @@ insert into user (id, email, first_name, last_name, status) values
   (3, 'grace@example.com', 'Grace', 'White', 1);
 insert into `group`(id, name) values
   (1, 'ADMIN'),
-  (2, 'STAFF');
+  (2, 'STAFF'),
+  (3, 'CUSTOMER');
 insert into user_group(group_id, user_id) values
   (1, 1),
   (1, 2),
-  (2, 2);
+  (2, 2),
+  (3, 3),
+  (2, 3);
 insert into category(id, parent_id, name) values
   (1, NULL, 'All'),
   (2, 1, 'Fruit'),
@@ -16,7 +19,11 @@ insert into category(id, parent_id, name) values
   (4, 2, 'Banana'),
   (5, 1, 'Meat' ),
   (6, 5, 'Beef' ),
-  (7, 5, 'Lamb' );
+  (7, 5, 'Lamb' ),
+  (8, 1, 'American Fruit');
+
+insert into category_tree(ancestor_id, descendant_id, distance) values (3, 3, 0);
+
 insert into product (id, sku, name, price, status) values
   (1, 'sku001', 'Australian Apple',  5, 1),
   (2, 'sku002', 'Australian Banana', 6, 1),
@@ -30,6 +37,7 @@ insert into product_category(product_id, category_id) values
   (1, 3),
   (2, 4),
   (3, 3),
+  (3, 8),
   (4, 4),
   (5, 5),
   (6, 6),
@@ -39,8 +47,8 @@ insert into delivery_address (id, street_address, city, state, country, postal_c
   (1, '1 King William Street', 'Adelaide', 'South Australia', 'Australia', '5000'),
   (2, '2 King William Street', 'Adelaide', 'South Australia', 'Australia', '5000');
 insert into `order` (id, code, date_created, user_id, delivery_address_id, status) values
-  (1, 'order-1', '2018-3-20', 3, 1, 1),
-  (2, 'order-2', '2018-3-21', 3, 2, 1);
+  (1, 'order-1', '2018-03-20 00:00:00.000', 3, 1, 1),
+  (2, 'order-2', '2018-03-21 00:00:00.000', 3, 2, 1);
 insert into order_item (order_id, product_id, quantity) values
   (1, 1, 2), -- 2 kg of australian apple
   (1, 3, 1), -- 1 kg of american apple

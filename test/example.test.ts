@@ -1,5 +1,5 @@
 import { Database } from '../src/database';
-import { Schema, SimpleField } from '../src/model';
+import { SimpleField } from 'sqlex';
 
 import helper = require('./helper');
 
@@ -72,7 +72,7 @@ test('query', async done => {
           name: 'title'
         },
         where: { name_like: '%' },
-        orderBy: ['name asc']
+        orderBy: ['name']
       }
     };
 
@@ -90,7 +90,7 @@ test('query', async done => {
           name: 'title'
         },
         where: { name_like: '%' },
-        orderBy: ['name desc'],
+        orderBy: ['-name'],
         limit: 1
       }
     };
@@ -110,7 +110,7 @@ test('query', async done => {
 });
 
 test('create', async done => {
-  const db = getDatabase();
+  const db = helper.connectToDatabase(NAME);
 
   const { User, Post } = db.getModels();
 
@@ -131,53 +131,94 @@ test('create', async done => {
   done();
 });
 
-// test('models', async done => {
-//   const db = getDatabase();
+test('append #1', async done => {
+  const db = helper.connectToDatabase(NAME);
+  const title = 'Example Post #1';
 
-//   const { User, Order } = db.getModels();
+  db.table('post').append({ title });
 
-//   const user = new User({ email: 'user02@example.com' });
-//   const order = new Order({ code: 'order-2' });
+  await db.flush();
 
-//   await user.orders.add(order);
+  const posts = await db.table('post').select('*', { where: { title } });
 
-//   expect(
-//     (await db.table('order').select('*', { where: { user } })).length
-//   ).toBe(1);
+  expect(posts.length).toBe(1);
 
-//   user.orders.remove(order);
+  done();
+});
 
-//   await user.save();
+test('append #2', async done => {
+  const db = helper.connectToDatabase(NAME);
+  const title = 'Example Post #2';
+  const content = 'Example Comment #';
+  const post = db.table('post').append({ title });
+  const comment = db.table('comment').append({ post, content });
 
-//   expect(
-//     (await db.table('order').select('*', { where: { user } })).length
-//   ).toBe(0);
+  const comment1 = db
+    .table('comment')
+    .append({ post, content: content + '1', parent: comment });
 
-//   done();
-// });
+  const comment2 = db.table('comment').append({
+    post,
+    content: content + '2',
+    parent: comment1
+  });
 
-function getDatabase() {
-  return new Database(
+  db.table('comment').append({
+    post,
+    content: content + '3',
+    parent: comment1
+  });
+
+  await db.flush();
+
+  const posts = await db.table('post').select('*', { where: { title } });
+
+  expect(posts.length).toBe(1);
+
+  const comments = await db
+    .table('comment')
+    .select('*', { where: { content_like: content + '%' } });
+
+  expect(comments.length).toBe(4);
+
+  const commentId = comments.find(entry => entry.content === content + '1').id;
+  const replies = comments.filter(
+    entry => entry.parent && entry.parent.id === commentId
+  );
+
+  expect(replies.length).toBe(2);
+
+  done();
+});
+
+test('select', async done => {
+  const db = helper.connectToDatabase(NAME);
+
+  const post = db.table('post').append({ title: '#3' });
+  db.table('comment').append({ post, content: '#3.1' });
+  db.table('comment').append({ post: null, content: '#.2' });
+
+  await db.flush();
+
+  const rows = await db.table('comment').select(
     {
-      dialect: 'mysql',
-      connection: {
-        host: 'localhost',
-        user: 'root',
-        password: 'secret',
-        database: 'blog',
-        timezone: 'Z',
-        connectionLimit: 10
+      post: {
+        comments: {
+          content: 'body'
+        }
       }
     },
-    new Schema(
-      JSON.parse(
-        require('fs')
-          .readFileSync('schema.json')
-          .toString()
-      )
-    )
+    { where: { content_like: '#%' } }
   );
-}
+
+  expect(rows.length).toBe(2);
+
+  const row = rows.find(row => row.post === null);
+
+  expect(row.content).toBe('#.2');
+
+  done();
+});
 
 // https://github.com/nodejs/node/issues/8071
 require('util').inspect.defaultOptions.customInspect = false;

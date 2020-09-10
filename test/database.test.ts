@@ -1,5 +1,4 @@
-import { Schema, ForeignKeyField } from '../src/model';
-import { Value } from '../src/engine';
+import { Schema, Value } from 'sqlex';
 import helper = require('./helper');
 
 const NAME = 'database';
@@ -791,11 +790,24 @@ test('append', () => {
   expect(table.recordList.length).toBe(2);
 });
 
+test('append #2', async () => {
+  const db = helper.connectToDatabase(NAME);
+  const email = 'john@example.com';
+  db.table('user').append({ email, firstName: 'John' });
+  db.table('user').append({ email, firstName: 'Joe' });
+  await db.flush();
+  const user = await db.table('user').get({ email });
+  expect(user.firstName).toBe('Joe');
+});
+
 test('claim', async done => {
   const db = helper.connectToDatabase(NAME);
   const table = db.table('order');
 
-  for (let i = 0; i < 10; i++) {
+  const ROW_COUNT = 10;
+  const THREAD_COUNT = ROW_COUNT + 1;
+
+  for (let i = 0; i < ROW_COUNT; i++) {
     table.append({ code: `T-${i}`, status: 0 });
   }
 
@@ -806,18 +818,18 @@ test('claim', async done => {
 
   const promises = [];
 
-  for (let i = 0; i < 11; i++) {
+  for (let i = 0; i < THREAD_COUNT; i++) {
     promises.push(table.claim(filter, update));
   }
 
   Promise.all(promises).then(async rows => {
-    expect(rows.length).toBe(11);
+    expect(rows.length).toBe(THREAD_COUNT);
     const empty = rows.filter(row => row === null);
     expect(empty.length).toBe(1);
     rows = await table.select('*', { where: filter });
     expect(rows.length).toBe(0);
     rows = await table.select('*', { where: { ...filter, ...update } });
-    expect(rows.length).toBe(10);
+    expect(rows.length).toBe(ROW_COUNT);
     done();
   });
 });

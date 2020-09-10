@@ -32,6 +32,15 @@ create table category (
   unique (parent_id, name)
 );
 
+create table category_attribute (
+  id integer primary key auto_increment,
+  category_id integer default null,
+  name varchar(80),
+  value varchar(1024),
+  foreign key (category_id) references category(id) on delete set null,
+  unique (category_id, name)
+);
+
 create table category_tree (
   id integer primary key auto_increment,
   ancestor_id integer not null,
@@ -44,8 +53,8 @@ create table category_tree (
 
 create table product (
   id integer primary key auto_increment,
-  sku char(40) unique,
-  name char(200),
+  sku varchar(40) unique,
+  name varchar(200),
   price float,
   stock_quantity float,
   status int
@@ -72,7 +81,7 @@ create table delivery_address (
 
 create table `order` (
   id integer primary key auto_increment,
-  code char(40) unique,
+  code varchar(40) unique,
   date_created datetime default current_timestamp,
   user_id integer default null,
   delivery_address_id integer default null,
@@ -87,22 +96,22 @@ create table order_item (
   product_id integer,
   quantity float,
   constraint order_product unique (order_id, product_id),
-  foreign key (order_id) references `order`(id),
+  foreign key (order_id) references `order`(id) on delete cascade,
   foreign key (product_id) references product(id)
 );
 
 create table `order_shipping` (
   order_id integer primary key,
   status int,
-  foreign key (order_id) references `order`(id)
+  foreign key (order_id) references `order`(id) on delete cascade
 );
 
 create table `order_shipping_event` (
   id integer primary key auto_increment,
   order_shipping_id integer,
   event_time datetime,
-  event_description char(200),
-  foreign key (order_shipping_id) references order_shipping(order_id),
+  event_description varchar(200),
+  foreign key (order_shipping_id) references order_shipping(order_id) on delete cascade,
   unique (order_shipping_id, event_time)
 );
 
@@ -116,17 +125,25 @@ create table `store_product` (
   store_id integer,
   product_id integer,
   price float,
-  constraint unique (store_id, product_id),
+  unique (store_id, product_id),
   foreign key (store_id) references store(id),
   foreign key (product_id) references product(id)
 );
 
 create table post(
-  id int key auto_increment,
+  id integer primary key auto_increment,
   title varchar(100),
   user_id int,
-  unique (user_id, title),
   foreign key (user_id) references user(id)
+);
+
+create table comment(
+  id integer primary key auto_increment,
+  post_id int,
+  parent_id integer default null,
+  content varchar(100),
+  foreign key (parent_id) references comment(id) on delete cascade,
+  foreign key (post_id) references post(id) on delete cascade
 );
 
 alter table user add foreign key (first_post_id) references post(id);

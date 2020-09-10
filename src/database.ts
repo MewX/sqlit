@@ -1,8 +1,13 @@
-import { Value, ConnectionInfo, createConnectionPool } from './engine';
-
-import { flushDatabase } from './flush';
+import { ConnectionInfo, createConnectionPool } from './engine';
+import { flushDatabase, replaceRecord, FlushOptions } from './flush';
 import { RecordProxy, Record, getModel } from './record';
-
+import {
+  loadTable,
+  RecordConfig,
+  recordConfigToDocument,
+  mapDocument,
+  parseRelatedOption
+} from './loader';
 import {
   Schema,
   Model,
@@ -10,11 +15,12 @@ import {
   SimpleField,
   ForeignKeyField,
   RelatedField,
-  ColumnInfo,
-  UniqueKey,
-  SchemaConfig
-} from './model';
-
+  isValue,
+  Column as ColumnInfo,
+  Document,
+  Value
+} from 'sqlex';
+import { Schema as SchemaConfig } from 'sqlex/dist/config';
 import {
   Connection,
   ConnectionPool,
@@ -22,16 +28,14 @@ import {
   getInformationSchema
 } from './engine';
 
-export type Document = {
-  [key: string]: Value | Value[] | Document | Document[];
-};
-
 export type Filter = Document | Document[];
 
 import { encodeFilter, QueryBuilder, AND } from './filter';
 import { toArray } from './misc';
 
 import { createNode, moveSubtree, deleteSubtree, treeQuery } from './tree';
+import { selectTree, selectTree2, FieldOptions } from './select';
+import { JsonSerialiser } from './serialiser';
 
 export class ClosureTable {
   constructor(
@@ -52,6 +56,7 @@ export class Database {
   constructor(connection: ConnectionPool | ConnectionInfo, schema?: Schema) {
     if (connection instanceof ConnectionPool) {
       this.pool = connection;
+      this.name = this.pool.name;
     } else if (connection) {
       this.pool = createConnectionPool(
         connection.dialect,
@@ -74,8 +79,9 @@ export class Database {
     return new Promise(resolve =>
       this.pool.getConnection().then(connection =>
         getInformationSchema(connection, this.name).then(schemaInfo => {
-          const schema = new Schema(schemaInfo);
+          const schema = new Schema(schemaInfo, config);
           this.setSchema(schema);
+          connection.release();
           resolve(schema);
         })
       )
@@ -92,7 +98,7 @@ export class Database {
     for (const model of schema.models) {
       const table = new Table(this, model);
       this.tableMap[model.name] = table;
-      this.tableMap[model.table.name] = table;
+      this.tableMap[model.table.shortName] = table;
       this.tableList.push(table);
     }
 
@@ -160,13 +166,17 @@ export class Database {
     }, 0);
   }
 
-  flush() {
+  flush(flushOptions?: FlushOptions) {
     return this.pool.getConnection().then(connection =>
-      flushDatabase(connection, this).then(result => {
+      flushDatabase(connection, this, flushOptions).then(() => {
         connection.release();
         return connection;
       })
     );
+  }
+
+  end(): Promise<void> {
+    return this.pool ? this.pool.end() : Promise.resolve();
   }
 
   clear() {
@@ -237,142 +247,206 @@ export class Table {
     );
   }
 
-  select(
+  async select(
     fields: string | Document,
     options: SelectOptions = {},
-    filterThunk?: (builder: QueryBuilder) => string
-  ): Promise<Row[]> {
-    return this.db.pool.getConnection().then(connection =>
-      this._select(connection, fields, options, filterThunk).then(result => {
-        if (typeof fields === 'string' || fields instanceof SimpleField) {
-          connection.release();
-          return result;
+    filterThunk?: (builder: QueryBuilder) => string,
+    connection?: Connection
+  ): Promise<Document[]> {
+    if (connection) {
+      const result = await this._select(
+        connection,
+        fields,
+        options,
+        filterThunk
+      );
+      await this._resolveRelatedFields(connection, result, fields);
+      return result;
+    }
+    connection = await this.db.pool.getConnection();
+    try {
+      const result = await this._select(
+        connection,
+        fields,
+        options,
+        filterThunk
+      );
+      await this._resolveRelatedFields(connection, result, fields);
+      connection.release();
+      return result;
+    } catch (error) {
+      connection.release();
+      throw error;
+    }
+  }
+
+  async _resolveRelatedFields(
+    connection: Connection,
+    result: Document[],
+    fields: string | Document
+  ): Promise<Document[]> {
+    if (typeof fields === 'string' || fields instanceof SimpleField) {
+      return Promise.resolve(result);
+    }
+
+    const pk = this.model.keyField().name;
+    const values = result.map(row => this.model.valueOf(row, pk));
+
+    for (const name in fields) {
+      const field = this.model.field(name);
+      const value = fields[name];
+
+      if (field instanceof RelatedField && value) {
+        let options, fields;
+        if (typeof value !== 'object') {
+          options = {};
         } else {
-          const pk = this.model.keyField().name;
-          const values = result.map(row => this.model.valueOf(row, pk));
-          const promises = [];
-
-          for (const name in fields) {
-            const field = this.model.field(name);
-            const value = fields[name];
-
-            if (field instanceof RelatedField && value) {
-              let options, fields;
-              if (typeof value !== 'object') {
-                options = {};
-              } else {
-                options = Object.assign({}, value);
-                if (options.fields) {
-                  fields = options.fields;
-                  delete options.fields;
-                } else {
-                  fields = '*';
-                }
-              }
-
-              const promise = this._selectRelated(
-                field,
-                values,
-                fields,
-                options
-              ).then(rows => {
-                result.forEach((entry, index) => {
-                  entry[name] = rows[index];
-                });
-              });
-
-              promises.push(promise);
-            }
+          options = Object.assign({}, value);
+          // TODO: Document options.fields for related fields!
+          if (options.fields) {
+            fields = options.fields;
+            delete options.fields;
+          } else {
+            fields = '*';
           }
-          return Promise.all(promises).then(() => {
-            connection.release();
-            return result;
-          });
         }
-      })
-    );
+        const rows = await this._selectRelated(
+          connection,
+          field,
+          values,
+          fields,
+          options
+        );
+        result.forEach((entry, index) => {
+          entry[name] = rows[index];
+        });
+      }
+    }
+
+    for (const name in fields) {
+      const field = this.model.field(name);
+      const value = fields[name] as Document;
+      if (value) {
+        if (field instanceof ForeignKeyField) {
+          const table = this.db.table(field.referencedField.model);
+          if (shouldSelectSeparately(table.model, value)) {
+            const values: Value[] = [];
+            for (const row of result) {
+              const doc = row[field.name] as Document;
+              if (doc === null) {
+                values.push(null);
+              } else {
+                values.push(table.model.keyValue(doc));
+              }
+            }
+            const docs = await table.select(
+              value,
+              {
+                where: { [table.model.keyField().name]: values }
+              },
+              undefined,
+              connection
+            );
+            for (const row of result) {
+              const value = table.model.keyValue(row[field.name] as Document);
+              const doc = docs.find(doc => table.model.keyValue(doc) === value);
+              if (doc) {
+                row[field.name] = JSON.parse(JSON.stringify(doc));
+              }
+            }
+          } else if (field instanceof RelatedField) {
+            const rows = result
+              .map(r => r[name] as Document[])
+              .reduce((result, rows) => {
+                result = result.concat(rows);
+                return result;
+              }, []);
+            const table = this.db.table(field.referencingField.model);
+            await table._resolveRelatedFields(connection, rows, value);
+          }
+        }
+      }
+    }
+
+    return result;
   }
 
-  get(key: Value | Filter): Promise<Document> {
-    return this.db.pool.getConnection().then(connection =>
-      this._get(connection, key).then(result => {
-        connection.release();
-        return result;
-      })
-    );
+  async get(key: Value | Filter): Promise<Document> {
+    return this._call('_get', key);
   }
 
-  insert(data: Row): Promise<any> {
-    return this.db.pool.getConnection().then(connection =>
-      this._insert(connection, data).then(result => {
-        connection.release();
-        return result;
-      })
-    );
+  async insert(data: Row): Promise<any> {
+    return this._call('_insert', data);
   }
 
-  create(data: Document): Promise<Document> {
-    return this.db.pool.getConnection().then(connection =>
-      connection.transaction(() =>
-        this._create(connection, data).then(result => {
-          connection.release();
-          return result;
-        })
-      )
-    );
+  async create(data: Document): Promise<Document> {
+    return this._call('_create', data);
   }
 
-  update(data: Document, filter: Filter): Promise<any> {
-    return this.db.pool.getConnection().then(connection =>
-      this._update(connection, data, filter).then(result => {
-        connection.release();
-        return result;
-      })
-    );
+  async update(data: Document, filter: Filter): Promise<any> {
+    return this._call('_update', data, filter);
   }
 
   upsert(data: Document, update?: Document): Promise<Document> {
-    return this.db.pool.getConnection().then(connection =>
-      connection.transaction(() =>
-        this._upsert(connection, data, update).then(result => {
-          connection.release();
-          return result;
-        })
-      )
-    );
+    return this._call('_upsert', data, update);
   }
 
   modify(data: Document, filter: Filter): Promise<Document> {
-    return this.db.pool.getConnection().then(connection =>
-      connection.transaction(() =>
-        this._modify(connection, data, filter).then(result => {
+    return this._call('_modify', data, filter);
+  }
+
+  private async _call(
+    method: string,
+    data?: Document | Value | Filter,
+    filter?: Filter | Document
+  ): Promise<any> {
+    const connection = await this.db.pool.getConnection();
+    try {
+      const result = await this[method](connection, data, filter);
+      connection.release();
+      return result;
+    } catch (error) {
+      connection.release();
+      throw error;
+    }
+  }
+
+  async delete(filter: Filter): Promise<any> {
+    if (this.closureTable) return this._call('_delete', filter);
+
+    const connection = await this.db.pool.getConnection();
+    try {
+      return connection.transaction(() =>
+        this._delete(connection, filter).then(result => {
           connection.release();
           return result;
+        })
+      );
+    } catch (error) {
+      connection.release();
+      throw error;
+    }
+  }
+
+  replace(data: Document): Promise<Record> {
+    return this.db.pool.getConnection().then(connection =>
+      connection.transaction(() =>
+        replaceRecord(connection, this, data).then(record => {
+          connection.release();
+          return record;
         })
       )
     );
   }
 
-  delete(filter: Filter): Promise<any> {
-    return this.db.pool.getConnection().then(connection => {
-      if (this.closureTable) {
-        return connection.transaction(() =>
-          this._delete(connection, filter).then(result => {
-            connection.release();
-            return result;
-          })
-        );
-      } else {
-        return this._delete(connection, filter).then(result => {
-          connection.release();
-          return result;
-        });
-      }
-    });
-  }
+  count(filter?: Filter, expr?: string): Promise<number> {
+    let sql;
 
-  count(filter?: Filter): Promise<number> {
-    let sql = `select count(1) as result from ${this._name()}`;
+    if (expr) {
+      sql = `select count(${expr}) as result from ${this._name()}`;
+    } else {
+      sql = `select count(1) as result from ${this._name()}`;
+    }
 
     if (filter) {
       sql += ` where ${this._where(filter)}`;
@@ -419,14 +493,21 @@ export class Table {
     if (options.limit !== undefined) {
       sql += ` limit ${parseInt(options.limit + '')}`;
     }
-
     if (options.offset !== undefined) {
       sql += ` offset ${parseInt(options.offset + '')}`;
     }
     return connection.query(sql).then(rows => {
-      return filterThunk
-        ? rows
-        : rows.map(row => toDocument(row, this.model, builder.fieldMap));
+      return rows.map(row => {
+        const doc = toDocument(row, this.model, builder.fieldMap);
+        if (filterThunk) {
+          for (const key in row) {
+            if (key.indexOf('__') !== -1) {
+              doc[key] = row[key];
+            }
+          }
+        }
+        return doc;
+      });
     });
   }
 
@@ -439,8 +520,8 @@ export class Table {
 
     for (const name in filter) {
       if (name in data) {
-        const lhs = data[name];
-        const rhs = filter[name];
+        const lhs = this.model.valueOf(data, name);
+        const rhs = this.model.valueOf(filter as Document, name);
         if (lhs === null) {
           if (rhs === null) {
             delete data[name];
@@ -458,7 +539,7 @@ export class Table {
       return Promise.resolve(0);
     }
 
-    let sql = `update ${this._name()} set`;
+    let sql = `update ${this._name()} set `;
     let cnt = 0;
 
     const keys = Object.keys(data);
@@ -494,7 +575,9 @@ export class Table {
     const name = keys.map(key => this.escapeName(key)).join(', ');
     const value = keys.map(key => this.escapeValue(key, data[key])).join(', ');
     const sql = `insert into ${this._name()} (${name}) values (${value})`;
-    return connection.query(sql);
+    return connection
+      .query(sql, this.model.keyField().column.name)
+      .then(insertId => (typeof insertId === 'number' ? insertId : 0));
   }
 
   _delete(connection: Connection, filter: Filter): Promise<any> {
@@ -542,11 +625,12 @@ export class Table {
   }
 
   _get(connection: Connection, key: Value | Filter): Promise<Document> {
+    if (key === undefined) throw Error(`Bad filter`);
     if (key === null || typeof key !== 'object') {
       key = {
         [this.model.keyField().name]: key
       };
-    } else if (!this.model.checkUniqueKey(key)) {
+    } else if (!this.model.checkUniqueKey(key as Document)) {
       const msg = `Bad selector: ${JSON.stringify(key)}`;
       return Promise.reject(Error(msg));
     }
@@ -624,11 +708,10 @@ export class Table {
     return this._resolveParentFields(connection, data).then(row =>
       this._insert(connection, row).then(id => {
         return this._updateChildFields(connection, data, id).then(() =>
-          this._get(connection, id).then(
-            row =>
-              this.closureTable
-                ? createNode(connection, this, row).then(() => row)
-                : row
+          this._get(connection, id).then(row =>
+            this.closureTable
+              ? createNode(connection, this, row).then(() => row)
+              : row
           )
         );
       })
@@ -647,7 +730,7 @@ export class Table {
     const self = this;
 
     return this._resolveParentFields(connection, data).then(row => {
-      const uniqueFields = self.model.getUniqueFields(row);
+      const uniqueFields = getUniqueFields(self.model, row);
       return self._get(connection, uniqueFields).then(row => {
         if (!row) {
           return self._create(connection, data);
@@ -667,7 +750,7 @@ export class Table {
     data: Document,
     filter: Filter
   ): Promise<Document> {
-    if (!this.model.checkUniqueKey(filter)) {
+    if (!this.model.checkUniqueKey(filter as Document)) {
       return Promise.reject(`Bad filter: ${JSON.stringify(filter)}`);
     }
 
@@ -684,11 +767,10 @@ export class Table {
         return self._get(connection, where as Document).then(row => {
           if (row) {
             const id = row[this.model.keyField().name] as Value;
-            return this._updateChildFields(connection, data, id).then(
-              () =>
-                !this.closureTable || !data[this.getParentField().name]
-                  ? row
-                  : moveSubtree(connection, this, row).then(() => row)
+            return this._updateChildFields(connection, data, id).then(() =>
+              !this.closureTable || !data[this.getParentField().name]
+                ? row
+                : moveSubtree(connection, this, row).then(() => row)
             );
           } else {
             return Promise.resolve(row);
@@ -723,10 +805,9 @@ export class Table {
   ): Promise<any> {
     const promises = [];
     const field = related.referencingField;
-    if (!field) throw Error(`Bad field ${related.displayName()}`);
+    if (!field) throw Error(`Bad field ${related.fullname}`);
     const table = this.db.table(field.model);
     if (!data || field.model.keyValue(data) === null) {
-      const nullable = field.column.nullable;
       if (field.column.nullable) {
         return table._update(
           connection,
@@ -782,7 +863,6 @@ export class Table {
           promises.push(this._upsertThrough(connection, related, id, args));
           continue;
         }
-        const rows = [];
         for (const arg of toArray(args)) {
           let { create, update } = arg;
           if (!create && !field.isUnique()) {
@@ -880,14 +960,13 @@ export class Table {
     const table = this.db.table(related.throughField.referencedField.model);
     const mapping = this.db.table(related.throughField.model);
     const promises = args.map(arg =>
-      table._get(connection, arg).then(
-        row =>
-          row
-            ? mapping._create(connection, {
-                [related.referencingField.name]: value,
-                [related.throughField.name]: row[table.model.keyField().name]
-              })
-            : Promise.resolve(null)
+      table._get(connection, arg).then(row =>
+        row
+          ? mapping._create(connection, {
+              [related.referencingField.name]: value,
+              [related.throughField.name]: row[table.model.keyField().name]
+            })
+          : Promise.resolve(null)
       )
     );
     return Promise.all(promises);
@@ -1007,6 +1086,8 @@ export class Table {
 
   claim(filter: Filter, data: Document, orderBy?: string[]): Promise<Document> {
     const self = this;
+    const MAX_TRY = 5;
+    let try_count = 0;
 
     return new Promise(resolve => {
       function _select() {
@@ -1021,13 +1102,26 @@ export class Table {
       }
 
       function _update(row) {
-        self.update(data, self.model.getUniqueFields(row)).then(result => {
-          if (result === 1) {
-            resolve(row);
-          } else {
-            setTimeout(_select, Math.random() * 1000);
-          }
-        });
+        const where = { ...filter, ...getUniqueFields(self.model, row) };
+        self
+          .update(data, where)
+          .then(result => {
+            if (result.changedRows === 1) {
+              resolve(row);
+            } else if (try_count++ < MAX_TRY) {
+              setTimeout(_select, Math.random() * 1000);
+            } else {
+              throw Error('Too busy');
+            }
+          })
+          .catch(error => {
+            // Error: SQLITE_BUSY: database is locked
+            if (try_count++ < MAX_TRY) {
+              setTimeout(_select, Math.random() * 1000);
+            } else {
+              throw error;
+            }
+          });
       }
 
       _select();
@@ -1042,6 +1136,20 @@ export class Table {
       this.recordList.push(record);
       this._mapPut(record);
       return record;
+    }
+    for (const name in data) {
+      if (existing[name] != data[name]) {
+        const field = record.__table.model.field(name);
+        if (field instanceof ForeignKeyField) {
+          const model = field.referencedField.model;
+          if (existing[name] !== undefined) {
+            if (pkOf(model, existing[name]) == pkOf(model, data[name])) {
+              continue;
+            }
+          }
+        }
+        existing[name] = data[name];
+      }
     }
     return existing;
   }
@@ -1099,6 +1207,7 @@ export class Table {
   }
 
   _selectRelated(
+    connection: Connection,
     field: RelatedField,
     values: Value[],
     fields,
@@ -1118,13 +1227,20 @@ export class Table {
           };
           if (options.orderBy) {
             const prefix = field.throughField.name;
-            options.orderBy = toArray(options.orderBy).map(
-              name => `${prefix}.${name}`
+            options.orderBy = toArray(options.orderBy).map((name: string) =>
+              name[0] === '-'
+                ? `-${prefix}.${name.substring(1)}`
+                : `${prefix}.${name}`
             );
           }
           promises.push(
             table
-              .select({ [field.throughField.name]: fields }, options)
+              .select(
+                { [field.throughField.name]: fields },
+                options,
+                undefined,
+                connection
+              )
               .then(rows => rows.map(row => row[field.throughField.name]))
           );
         }
@@ -1133,7 +1249,7 @@ export class Table {
           const options = Object.assign({}, selectOptions);
           options.where = Object.assign({}, options.where, { [name]: value });
           promises.push(
-            table.select(fields, options).then(rows => {
+            table.select(fields, options, undefined, connection).then(rows => {
               if (field.referencingField.isUnique()) {
                 const row = rows[0];
                 if (row) {
@@ -1160,12 +1276,19 @@ export class Table {
       options.where[field.referencingField.name] = values;
       if (options.orderBy) {
         const prefix = field.throughField.name;
-        options.orderBy = toArray(options.orderBy).map(
-          name => `${prefix}.${name}`
+        options.orderBy = toArray(options.orderBy).map((name: string) =>
+          name[0] === '-'
+            ? `-${prefix}.${name.substring(1)}`
+            : `${prefix}.${name}`
         );
       }
       return table
-        .select({ [field.throughField.name]: fields }, options)
+        .select(
+          { [field.throughField.name]: fields },
+          options,
+          undefined,
+          connection
+        )
         .then(rows => {
           const id = field.referencingField.model.keyField().name;
           if (field.referencingField.isUnique()) {
@@ -1181,11 +1304,11 @@ export class Table {
         });
     } else {
       options.where[name] = values;
-      return table.select(fields, options).then(rows => {
+      return table.select(fields, options, undefined, connection).then(rows => {
         const id = field.referencingField.model.keyField().name;
         if (field.referencingField.isUnique()) {
           return values.map(key => {
-            const row = rows.find(row => row[name][id] === key);
+            const row = rows.find(row => row[name] && row[name][id] === key);
             if (row) {
               delete row[name];
             }
@@ -1204,6 +1327,75 @@ export class Table {
       });
     }
   }
+
+  // It is strongly recommended to call db.clear() before calling this method!
+  xappend(
+    data: Document | Document[],
+    config: RecordConfig,
+    defaults?: Document
+  ): Promise<any> {
+    return loadTable(this, data, config, defaults);
+  }
+
+  xselect(
+    config: RecordConfig,
+    options: SelectOptions = {}
+  ): Promise<Document[]> {
+    config = { ...config };
+
+    let attrs;
+    if (config['*']) {
+      attrs = config['*'];
+      delete config['*'];
+    }
+
+    const fields = recordConfigToDocument(this, config);
+
+    return this.select(fields, options).then(docs => {
+      if (attrs) {
+        const options = parseRelatedOption(attrs);
+        const table = this.db.table(
+          (this.model.field(options.name) as RelatedField).referencingField
+            .model
+        );
+        const range = docs.map(doc => this.model.keyValue(doc));
+        const field = table.model.getForeignKeyOf(this.model);
+        return table
+          .select('*', { where: { [field.name]: range } })
+          .then(rows => {
+            const result = [];
+            for (const doc of docs) {
+              const kv = this.model.keyValue(doc);
+              const rs = (rows as Document[]).filter(
+                row => this.model.keyValue(row[field.name] as Document) === kv
+              );
+              for (const d of mapDocument(doc, config)) {
+                for (const r of rs) {
+                  const name = r[options.key] as string;
+                  const value = r[options.value];
+                  d[name] = value;
+                }
+                result.push(d);
+              }
+            }
+            return result;
+          });
+      } else {
+        return [].concat.apply([], docs.map(doc => mapDocument(doc, config)));
+      }
+    });
+  }
+
+  async selectTree(
+    filter: Filter,
+    options?: FieldOptions
+  ): Promise<Document[] | null> {
+    const data = await (options
+      ? selectTree(this, filter, options)
+      : selectTree2(this, filter));
+    const serialiser = new JsonSerialiser(data);
+    return serialiser.serialise(this.model);
+  }
 }
 
 export function _toCamel(value: Value, field: SimpleField): Value {
@@ -1211,13 +1403,21 @@ export function _toCamel(value: Value, field: SimpleField): Value {
 
   if (value instanceof Record) return value;
 
+  if (/text|string/i.test(field.column.type)) {
+    return value;
+  }
+
   if (/date|time/i.test(field.column.type)) {
     // MUST BE IN ISO 8601 FORMAT!
     return new Date(value as string).toISOString();
   }
 
   if (/int|long/i.test(field.column.type)) {
-    return parseInt(value as string);
+    return typeof value === 'boolean'
+      ? value
+        ? 1
+        : 0
+      : parseInt(value as string);
   }
 
   if (/float|double/i.test(field.column.type)) {
@@ -1246,18 +1446,33 @@ export function toRow(value: Value, field: SimpleField): Value {
   if (value && /date|time/i.test(field.column.type)) {
     return new Date(value as string)
       .toISOString()
-      .slice(0, 19)
+      .slice(0, 23) // datetime(3)
       .replace('T', ' ');
   }
   return value;
 }
 
+function setNullForeignKeys(result: Document, model: Model): Document {
+  if (model.keyValue(result) === null) {
+    return null;
+  }
+
+  for (const field of model.fields) {
+    if (field instanceof ForeignKeyField && result[field.name]) {
+      result[field.name] = setNullForeignKeys(
+        result[field.name] as Document,
+        field.referencedField.model
+      );
+    }
+  }
+
+  return result;
+}
+
 export function toDocument(row: Row, model: Model, fieldMap = {}): Document {
   const result = {};
-
   for (const key in row) {
     const fieldNames = key.split('__');
-
     let currentResult = result;
     let currentModel = model;
 
@@ -1277,7 +1492,6 @@ export function toDocument(row: Row, model: Model, fieldMap = {}): Document {
     const field = currentModel.field(fieldNames[fieldNames.length - 1]);
 
     const fieldName = fieldMap[key] || field.name;
-
     if (field instanceof SimpleField) {
       const value = _toCamel(row[key], field);
       if (field instanceof ForeignKeyField) {
@@ -1285,8 +1499,14 @@ export function toDocument(row: Row, model: Model, fieldMap = {}): Document {
           if (!(field.name in currentResult)) {
             currentResult[fieldName] = {};
           }
-          const name = field.referencedField.model.keyField().name;
-          currentResult[fieldName][name] = value;
+          let keyField = field.referencedField.model.keyField();
+          let result = currentResult[fieldName];
+          while (keyField instanceof ForeignKeyField) {
+            result[keyField.name] = {};
+            result = result[keyField.name];
+            keyField = keyField.referencedField.model.keyField();
+          }
+          result[keyField.name] = value;
         } else {
           currentResult[fieldName] = null;
         }
@@ -1296,7 +1516,7 @@ export function toDocument(row: Row, model: Model, fieldMap = {}): Document {
     }
   }
 
-  return result;
+  return setNullForeignKeys(result, model);
 }
 
 export function isEmpty(value: Value | Record | any) {
@@ -1315,13 +1535,44 @@ export function isEmpty(value: Value | Record | any) {
   return false;
 }
 
-export function isValue(value): boolean {
-  if (value === null) return true;
+function pkOf(model: Model, data: unknown): Value {
+  if (isValue(data)) return <Value>data;
+  const pk = model.keyField();
+  if (pk instanceof ForeignKeyField) {
+    return pkOf(pk.referencedField.model, (<Document>data)[pk.name]);
+  }
+  return <Value>(<Document>data)[pk.name];
+}
 
-  const type = typeof value;
-  if (type === 'string' || type === 'number' || type === 'boolean') {
-    return true;
+export function shouldSelectSeparately(
+  model: Model,
+  fields: string | Document
+) {
+  if (typeof fields === 'string') {
+    return false;
   }
 
-  return value instanceof Date;
+  for (const name in fields) {
+    if (model.field(name) instanceof RelatedField) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function getUniqueFields(model: Model, row: Document) {
+  const uniqueKey = model.checkUniqueKey(row);
+  if (uniqueKey) {
+    const fields = {};
+    for (const field of uniqueKey.fields) {
+      const value = row[field.name];
+      if (value instanceof Record) {
+        fields[field.name] = value.__primaryKey();
+      } else {
+        fields[field.name] = row[field.name];
+      }
+    }
+    return fields;
+  }
 }

@@ -1,11 +1,10 @@
 import { getInformationSchema } from './information_schema';
+import { Value } from 'sqlex';
 
 export interface ConnectionInfo {
   dialect: string;
   connection: any;
 }
-
-export type Value = string | number | boolean | Date | null;
 
 export type Row = {
   [key: string]: Value;
@@ -28,10 +27,14 @@ export interface Dialect {
 export abstract class Connection implements Dialect {
   dialect: string;
   connection: any;
+  name: string;
   queryCounter: QueryCounter;
 
-  abstract query(sql: string): Promise<any>;
-  abstract transaction(callback: TransactionCallback): Promise<any>;
+  abstract query(sql: string, pk?: string): Promise<any>;
+
+  beginTransaction(): Promise<void> {
+    return this.query('begin');
+  }
 
   commit(): Promise<void> {
     return this.query('commit');
@@ -41,18 +44,35 @@ export abstract class Connection implements Dialect {
     return this.query('rollback');
   }
 
-  abstract disconnect(): Promise<any>;
+  abstract end(): Promise<void>;
   abstract release();
 
   abstract escape(s: string): string;
   abstract escapeId(name: string): string;
+
+  async transaction(callback: TransactionCallback) {
+    await this.beginTransaction();
+    try {
+      const promise = callback(this);
+      if (promise instanceof Promise) {
+        const result = await promise;
+        this.commit();
+        return result;
+      }
+      // else: caller has dealt with the transaction
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
 }
 
 export abstract class ConnectionPool implements Dialect {
   dialect: string;
+  name: string;
 
   abstract getConnection(): Promise<Connection>;
-  abstract close(): Promise<any>;
+  abstract end(): Promise<void>;
 
   abstract escape(s: string): string;
   abstract escapeId(name: string): string;
@@ -63,15 +83,37 @@ export function createConnectionPool(
   connection: any
 ): ConnectionPool {
   if (dialect === 'mysql') {
-    return require('./mysql').default.createConnectionPool(connection);
+    const result = require('./mysql').default.createConnectionPool(connection);
+    result.name = connection.database;
+    return result;
   }
+
+  if (dialect === 'sqlite3') {
+    return require('./sqlite3').default.createConnectionPool(connection);
+  }
+
+  if (dialect === 'postgres') {
+    return require('./postgres').default.createConnectionPool(connection);
+  }
+
   throw Error(`Unsupported engine type: ${dialect}`);
 }
 
 export function createConnection(dialect: string, connection: any): Connection {
   if (dialect === 'mysql') {
-    return require('./mysql').default.createConnection(connection);
+    const result = require('./mysql').default.createConnection(connection);
+    result.name = connection.database;
+    return result;
   }
+
+  if (dialect === 'sqlite3') {
+    return require('./sqlite3').default.createConnection(connection);
+  }
+
+  if (dialect === 'postgres') {
+    return require('./postgres').default.createConnection(connection);
+  }
+
   throw Error(`Unsupported engine type: ${dialect}`);
 }
 

@@ -1,4 +1,10 @@
-import { Filter, OrderBy, isValue, toRow, Document } from './database';
+import {
+  Filter,
+  OrderBy,
+  toRow,
+  shouldSelectSeparately,
+  getUniqueFields
+} from './database';
 import { Record } from './record';
 
 import {
@@ -6,10 +12,13 @@ import {
   Field,
   SimpleField,
   ForeignKeyField,
-  RelatedField
-} from './model';
+  RelatedField,
+  Document,
+  Value,
+  isValue
+} from 'sqlex';
 
-import { Dialect, Value } from './engine';
+import { Dialect } from './engine';
 import { toArray } from './misc';
 
 export interface AliasEntry {
@@ -105,8 +114,8 @@ export class QueryBuilder {
     return exprs.length === 0
       ? ''
       : exprs.length === 1
-        ? exprs[0]
-        : exprs.map(x => `(${x})`).join(' or ');
+      ? exprs[0]
+      : exprs.map(x => `(${x})`).join(' or ');
   }
 
   private and(args: Filter): string {
@@ -129,7 +138,8 @@ export class QueryBuilder {
               filter.push(arg);
             }
           }
-          let expr = values.length > 0 ? this.expr(field, 'in', values) : '';
+          let expr =
+            values.length > 0 ? this.expr(field, 'in', values) : 'false';
           if (filter.length > 0) {
             if (expr.length > 0) expr += ' or ';
             expr += this._join(field, filter);
@@ -147,6 +157,26 @@ export class QueryBuilder {
                 exprs.push(this.expr(field, operator, value));
                 continue;
               }
+            }
+            const relatedField = field.referencedField.model.field(name);
+            if (relatedField instanceof RelatedField) {
+              const referencingField = relatedField.referencingField;
+              const builder = new QueryBuilder(
+                referencingField.model,
+                this.dialect
+              );
+              let filter = query[keys[0]] as Filter;
+              if (relatedField.throughField && relatedField.name === keys[0]) {
+                filter = {
+                  [relatedField.throughField.name]: filter
+                };
+              }
+              const rhs = builder.select(referencingField, filter);
+              const lhs = this.alias
+                ? `${this.escapeId(this.alias)}.${this.escapeId(field)}`
+                : this.escapeId(field);
+              exprs.push(`${lhs} in (${rhs})`);
+              continue;
             }
           }
           const expr = this._join(field, query);
@@ -172,7 +202,7 @@ export class QueryBuilder {
               ]
          }
          */
-        exprs.push(value.map(c => this.and(c)).join(' or '));
+        exprs.push('(' + value.map(c => this.and(c)).join(' or ') + ')');
       } else if (key === NOT) {
         /*
          { not: [
@@ -185,15 +215,15 @@ export class QueryBuilder {
          */
         const filters = toArray(value);
         exprs.push('not (' + filters.map(c => this.and(c)).join(' or ') + ')');
-      } else {
+      } else if (name !== '*') {
         throw Error(`Bad field: ${this.model.name}.${name}`);
       }
     }
     return exprs.length === 0
       ? ''
       : exprs.length === 1
-        ? exprs[0]
-        : exprs.map(x => `(${x})`).join(' and ');
+      ? exprs[0]
+      : exprs.map(x => `(${x})`).join(' and ');
   }
 
   private expr(field: SimpleField, operator: string, value: Value | Value[]) {
@@ -204,7 +234,9 @@ export class QueryBuilder {
           .filter(value => value !== null)
           .map(value => this.escape(field, value));
         if (values.length < value.length) {
-          return `(${lhs} is null or ${lhs} in (${values.join(', ')}))`;
+          return values.length === 0
+            ? `${lhs} is null`
+            : `(${lhs} is null or ${lhs} in (${values.join(', ')}))`;
         } else {
           if (values.length === 0) return 'false';
           return `${lhs} in (${values.join(', ')})`;
@@ -229,20 +261,26 @@ export class QueryBuilder {
 
   _extendFilter(filter: Filter, orderBy: OrderBy): Filter {
     for (const entry of toArray(orderBy)) {
-      const fields = entry.split('.');
+      const fields = entry.replace(/^-/, '').split('.');
       let result = filter;
       let model = this.model;
       for (let i = 0; i < fields.length - 1; i++) {
         const name = fields[i];
-        if (!result[name]) {
-          result[name] = {};
-        }
         const field = model.field(name);
         if (!(field instanceof ForeignKeyField)) {
           throw Error(`Not a foreign key: ${entry}`);
         }
-        result = result[name];
-        model = field.referencedField.model;
+        if (
+          i < fields.length - 2 ||
+          (i === fields.length - 2 &&
+            fields[i + 1] !== field.referencedField.model.primaryKey.name())
+        ) {
+          if (!result[name]) {
+            result[name] = {};
+          }
+          result = result[name];
+          model = field.referencedField.model;
+        }
       }
     }
     return filter;
@@ -256,8 +294,13 @@ export class QueryBuilder {
 
     if (match) {
       const entry = aliasMap[match[1]];
-      alias = entry.name;
-      field = entry.model.field(match[2]);
+      if (entry) {
+        alias = entry.name;
+        field = entry.model.field(match[2]);
+      } else {
+        alias = this.alias || this.model.table.name;
+        field = this.model.field(path.split('.')[0]);
+      }
     } else {
       alias = this.alias || this.model.table.name;
       field = this.model.field(path);
@@ -290,7 +333,7 @@ export class QueryBuilder {
     }
 
     if (orderBy) {
-      // orderBy: ['user.email desc']
+      // orderBy: ['-user.email']
       filter = this._extendFilter(filter, orderBy);
     }
 
@@ -311,10 +354,11 @@ export class QueryBuilder {
     }
 
     if (orderBy) {
-      orderBy = toArray(orderBy).map(order => {
-        const [path, direction] = order.split(' ');
+      orderBy = toArray(orderBy).map((order: string) => {
+        const [path, direction] =
+          order[0] === '-' ? [order.substr(1), 'DESC'] : [order, 'ASC'];
         const column = this._pushField(fields, path);
-        return `${column} ${/^desc$/i.test(direction || '') ? 'DESC' : 'ASC'}`;
+        return `${column} ${direction}`;
       });
     }
 
@@ -345,7 +389,7 @@ export class QueryBuilder {
         } else {
           sql += ' and ';
         }
-        sql += extra;
+        sql += `(${extra})`;
       }
     }
     if (query.orderBy) {
@@ -492,9 +536,11 @@ export function splitKey(arg: string): string[] {
   return [arg];
 }
 
-function plainify(value) {
+export function plainify(value) {
   if (Array.isArray(value)) {
-    return value.map(entry => plainify(entry));
+    return value
+      .filter(entry => entry !== undefined)
+      .map(entry => plainify(entry));
   } else if (isValue(value)) {
     return value;
   } else if (value instanceof Record) {
@@ -502,7 +548,7 @@ function plainify(value) {
     if (value.__primaryKey()) {
       return { [model.keyField().name]: value.__primaryKey() };
     } else {
-      return model.getUniqueFields(value.__data);
+      return getUniqueFields(model, value.__data);
     }
   } else {
     const result = {};
@@ -511,6 +557,14 @@ function plainify(value) {
     }
     return result;
   }
+}
+
+function pkOnly(doc: Document, model: Model) {
+  if (doc && !isValue(doc)) {
+    const keys = Object.keys(doc);
+    return keys.length === 1 && keys[0] === model.keyField().name;
+  }
+  return false;
 }
 
 // Extends the filter to include foreign key fields
@@ -522,6 +576,12 @@ function extendFilter(model: Model, filter: Filter, fields: Document) {
       if (field instanceof ForeignKeyField) {
         if (!filter[name]) {
           filter[name] = {};
+        }
+        if (
+          fields[name] === '*' ||
+          !pkOnly(value as Document, field.referencedField.model)
+        ) {
+          filter[name]['*'] = true;
         }
         extendFilter(
           field.referencedField.model,
@@ -549,6 +609,7 @@ function getFields(
       result.push(getKey(field.name));
     }
   }
+
   if (typeof input === 'string') {
     if (input === '*') return result;
   }
@@ -566,8 +627,10 @@ function getFields(
       const field = model.field(name);
       if (field instanceof ForeignKeyField) {
         const model = field.referencedField.model;
-        const fields = getFields(model, value as Document, fieldMap, key);
-        result = result.concat(result, fields);
+        if (!shouldSelectSeparately(model, value as Document)) {
+          const fields = getFields(model, value as Document, fieldMap, key);
+          result = result.concat(fields);
+        }
       } else if (typeof value === 'string') {
         fieldMap[key.replace(/\./g, '__')] = value;
       }
